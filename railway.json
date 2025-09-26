@@ -1,1 +1,6 @@
-json<br>{<br> "build": { "builder": "NIXPACKS" },<br> "variables": { "PYTHONUNBUFFERED": "1" }<br>}
+{
+  "build": { "builder": "NIXPACKS" },
+  "variables": {
+    "PYTHONUNBUFFERED": "1"
+  }
+}

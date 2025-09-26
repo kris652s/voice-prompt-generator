@@ -7,7 +7,7 @@ app = Flask(__name__, static_folder="static")
 CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB
 
-# --- Lazy OpenAI client (created only when first used) ---
+# Lazy client so the app can start even if key is missing (it will error only on use)
 _client = None
 def get_client():
     global _client
@@ -22,19 +22,16 @@ def get_client():
 def health():
     return {"ok": True}
 
-# Serve static frontend
 @app.get("/")
 def root():
     return send_from_directory(app.static_folder, "index.html")
 
-# Main endpoint: voice -> English text -> refined prompt -> LLM response
 @app.post("/process-voice")
 def process_voice():
     if "audio" not in request.files:
         return jsonify({"error": "No 'audio' file in form-data"}), 400
     up = request.files["audio"]
 
-    # Save upload to a temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
         up.save(tmp.name)
         path = tmp.name
@@ -42,16 +39,16 @@ def process_voice():
     try:
         client = get_client()
 
-        # 1) Speech to English (preferred: translations)
+        # 1) Speech → English text (preferred: translations)
         try:
             transcript_text = client.audio.translations.create(
-                model="whisper-1",            # returns English
+                model="whisper-1",
                 file=open(path, "rb"),
                 response_format="text",
                 temperature=0
             ).strip()
         except Exception:
-            # Fallback: transcribe then translate via LLM
+            # Fallback: plain transcription then LLM translation
             raw_text = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=open(path, "rb"),
@@ -84,10 +81,8 @@ def process_voice():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
+        try: os.remove(path)
+        except Exception: pass
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)

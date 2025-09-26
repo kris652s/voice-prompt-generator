@@ -35,13 +35,15 @@ def process_voice():
 
     try:
         # 1) Speech-to-text + force English translation
-        transcript_text = client.audio.transcriptions.create(
-            model="whisper-1",          # or "gpt-4o-transcribe"
-            file=open(path, "rb"),
-            response_format="text",
-            temperature=0,
-            translate=True
-        ).strip()
+        # Translate any spoken language to English text
+transcript = client.audio.translations.create(
+    model="whisper-1",             # returns English
+    file=open(tmp_path, "rb"),
+    response_format="text",
+    temperature=0
+)
+raw_text = transcript.strip()
+
 
         # 2) Refine into a clean, actionable prompt
         refine_instructions = (

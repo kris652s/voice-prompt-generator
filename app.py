@@ -1,13 +1,15 @@
- from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os, tempfile
+
+# Use the v1 OpenAI SDK (pinned in requirements)
 from openai import OpenAI
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB
 
-# Lazy client so the app can start even if key is missing (it will error only on use)
+# Lazy client (created only when first used)
 _client = None
 def get_client():
     global _client
@@ -22,16 +24,19 @@ def get_client():
 def health():
     return {"ok": True}
 
+# Serve the static frontend
 @app.get("/")
 def root():
     return send_from_directory(app.static_folder, "index.html")
 
+# Main endpoint: voice -> English text -> refined prompt -> LLM response
 @app.post("/process-voice")
 def process_voice():
     if "audio" not in request.files:
         return jsonify({"error": "No 'audio' file in form-data"}), 400
     up = request.files["audio"]
 
+    # Save upload to temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
         up.save(tmp.name)
         path = tmp.name
@@ -39,7 +44,7 @@ def process_voice():
     try:
         client = get_client()
 
-        # 1) Speech → English text (preferred: translations)
+        # 1) Speech → English (prefer translations; fallback to transcription + LLM translate)
         try:
             transcript_text = client.audio.translations.create(
                 model="whisper-1",
@@ -48,7 +53,6 @@ def process_voice():
                 temperature=0
             ).strip()
         except Exception:
-            # Fallback: plain transcription then LLM translation
             raw_text = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=open(path, "rb"),
@@ -61,7 +65,7 @@ def process_voice():
             )
             transcript_text = trans.output_text.strip()
 
-        # 2) Refine into a clean, actionable prompt
+        # 2) Refine into an actionable prompt
         refine_instructions = (
             "You are a prompt engineer. Given the raw user intent below, "
             "output a single, clear, action-oriented LLM prompt. "
@@ -81,8 +85,12 @@ def process_voice():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        try: os.remove(path)
-        except Exception: pass
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # Use the port Railway provides if present (handy for debugging without gunicorn)
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

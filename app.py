@@ -7,38 +7,52 @@ app = Flask(__name__, static_folder="static")
 CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is not set")
-client = OpenAI(api_key=OPENAI_API_KEY)
+# --- Lazy OpenAI client (created only when first used) ---
+_client = None
+def get_client():
+    global _client
+    if _client is None:
+        key = os.getenv("OPENAI_API_KEY")
+        if not key:
+            raise RuntimeError("OPENAI_API_KEY is not set")
+        _client = OpenAI(api_key=key)
+    return _client
 
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+# Serve static frontend
 @app.get("/")
 def root():
     return send_from_directory(app.static_folder, "index.html")
 
+# Main endpoint: voice -> English text -> refined prompt -> LLM response
 @app.post("/process-voice")
 def process_voice():
     if "audio" not in request.files:
         return jsonify({"error": "No 'audio' file in form-data"}), 400
     up = request.files["audio"]
 
+    # Save upload to a temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
         up.save(tmp.name)
         path = tmp.name
 
     try:
-        # ----- 1) STT with English output -----
+        client = get_client()
+
+        # 1) Speech to English (preferred: translations)
         try:
-            # Preferred: direct English via translations
             transcript_text = client.audio.translations.create(
-                model="whisper-1",
+                model="whisper-1",            # returns English
                 file=open(path, "rb"),
                 response_format="text",
                 temperature=0
             ).strip()
         except Exception:
-            # Fallback: plain transcription + LLM translation to English
-            raw = client.audio.transcriptions.create(
+            # Fallback: transcribe then translate via LLM
+            raw_text = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=open(path, "rb"),
                 response_format="text",
@@ -46,11 +60,11 @@ def process_voice():
             ).strip()
             trans = client.responses.create(
                 model="gpt-4o-mini",
-                input=f"Translate to natural English, preserve meaning:\n\n{raw}"
+                input=f"Translate to natural English, preserve meaning:\n\n{raw_text}"
             )
             transcript_text = trans.output_text.strip()
 
-        # ----- 2) Refine into a clean, actionable prompt -----
+        # 2) Refine into a clean, actionable prompt
         refine_instructions = (
             "You are a prompt engineer. Given the raw user intent below, "
             "output a single, clear, action-oriented LLM prompt. "
@@ -58,17 +72,11 @@ def process_voice():
             "Output ONLY the final prompt.\n\n"
             f"Raw user intent:\n{transcript_text}"
         )
-        refined = client.responses.create(
-            model="gpt-4o-mini",
-            input=refine_instructions
-        )
+        refined = client.responses.create(model="gpt-4o-mini", input=refine_instructions)
         refined_prompt = refined.output_text.strip()
 
-        # ----- 3) Execute the refined prompt -----
-        final = client.responses.create(
-            model="gpt-4o-mini",
-            input=refined_prompt
-        )
+        # 3) Execute the refined prompt
+        final = client.responses.create(model="gpt-4o-mini", input=refined_prompt)
         final_text = final.output_text.strip()
 
         return jsonify({"refined_prompt": refined_prompt, "response": final_text})

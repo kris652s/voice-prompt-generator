@@ -1,5 +1,5 @@
- flask
-flask-cors
-openai>=1.43.0
-python-dotenv
-gunicorn
+ flask>=3.0.0,<4
+flask-cors>=4.0.0,<5
+openai>=1.40.0,<2
+python-dotenv>=1.0.0,<2
+gunicorn>=21.2.0,<22

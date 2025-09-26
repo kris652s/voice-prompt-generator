@@ -1,15 +1,13 @@
-from flask import Flask, request, jsonify, send_from_directory
+ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import os, tempfile
-
-# Use the v1 OpenAI SDK (pinned in requirements)
 from openai import OpenAI
 
 app = Flask(__name__, static_folder="static")
 CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB
 
-# Lazy client (created only when first used)
+# Lazy OpenAI client
 _client = None
 def get_client():
     global _client
@@ -24,12 +22,10 @@ def get_client():
 def health():
     return {"ok": True}
 
-# Serve the static frontend
 @app.get("/")
 def root():
     return send_from_directory(app.static_folder, "index.html")
 
-# Main endpoint: voice -> English text -> refined prompt -> LLM response
 @app.post("/process-voice")
 def process_voice():
     if "audio" not in request.files:
@@ -47,7 +43,7 @@ def process_voice():
         # 1) Speech → English (prefer translations; fallback to transcription + LLM translate)
         try:
             transcript_text = client.audio.translations.create(
-                model="whisper-1",
+                model="whisper-1",           # English output
                 file=open(path, "rb"),
                 response_format="text",
                 temperature=0
@@ -59,26 +55,36 @@ def process_voice():
                 response_format="text",
                 temperature=0
             ).strip()
-            trans = client.responses.create(
+            # Translate to English via Chat Completions
+            tr = client.chat.completions.create(
                 model="gpt-4o-mini",
-                input=f"Translate to natural English, preserve meaning:\n\n{raw_text}"
+                messages=[
+                    {"role": "system", "content": "Translate to natural English while preserving meaning."},
+                    {"role": "user", "content": raw_text}
+                ],
+                temperature=0
             )
-            transcript_text = trans.output_text.strip()
+            transcript_text = tr.choices[0].message.content.strip()
 
-        # 2) Refine into an actionable prompt
-        refine_instructions = (
-            "You are a prompt engineer. Given the raw user intent below, "
-            "output a single, clear, action-oriented LLM prompt. "
-            "Fix grammar, add obvious specifics, and keep it concise. "
-            "Output ONLY the final prompt.\n\n"
-            f"Raw user intent:\n{transcript_text}"
+        # 2) Refine into a clean, actionable prompt (Chat Completions)
+        refine = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content":
+                    "You are a prompt engineer. Given the user's raw intent, output a single, clear, action-oriented prompt that an LLM can execute directly. Fix grammar, add obvious specifics, and keep it concise. Output ONLY the final prompt."},
+                {"role": "user", "content": transcript_text}
+            ],
+            temperature=0
         )
-        refined = client.responses.create(model="gpt-4o-mini", input=refine_instructions)
-        refined_prompt = refined.output_text.strip()
+        refined_prompt = refine.choices[0].message.content.strip()
 
-        # 3) Execute the refined prompt
-        final = client.responses.create(model="gpt-4o-mini", input=refined_prompt)
-        final_text = final.output_text.strip()
+        # 3) Execute the refined prompt (Chat Completions)
+        final = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": refined_prompt}],
+            temperature=0.2
+        )
+        final_text = final.choices[0].message.content.strip()
 
         return jsonify({"refined_prompt": refined_prompt, "response": final_text})
 
@@ -91,6 +97,6 @@ def process_voice():
             pass
 
 if __name__ == "__main__":
-    # Use the port Railway provides if present (handy for debugging without gunicorn)
-    port = int(os.getenv("PORT", 5000))
+    import os as _os
+    port = int(_os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

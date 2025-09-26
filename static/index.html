@@ -1,1 +1,79 @@
-html<br><!doctype html><html><head><meta charset="utf-8"/><title>Voice → Prompt → LLM</title></head><body><h1>Voice → Prompt → LLM</h1><p>Setup OK. Recording UI will come later.</p></body></html>
+ <!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voice → Prompt → LLM</title>
+  <style>
+    body { font-family: system-ui, Arial, sans-serif; max-width: 720px; margin: 24px auto; }
+    button { padding: 10px 16px; font-size: 16px; }
+    #status { margin: 8px 0; opacity: .8; }
+    #refined, #result { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; border-radius: 8px; margin-top: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Voice → Prompt → LLM</h1>
+  <p>Click and speak. Recording stops automatically after 5 seconds.</p>
+
+  <button id="recordBtn">Start Recording</button>
+  <div id="status"></div>
+
+  <h3>Refined Prompt</h3>
+  <div id="refined"></div>
+
+  <h3>LLM Response</h3>
+  <div id="result"></div>
+
+  <script>
+    const recordBtn = document.getElementById('recordBtn');
+    const statusEl = document.getElementById('status');
+    const refinedEl = document.getElementById('refined');
+    const resultEl = document.getElementById('result');
+
+    let mediaRecorder, chunks = [];
+
+    async function record() {
+      chunks = [];
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+
+      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+
+      mediaRecorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        const form = new FormData();
+        form.append('audio', blob, 'audio.webm');
+
+        statusEl.textContent = 'Processing...';
+
+        try {
+          const res = await fetch('/process-voice', { method: 'POST', body: form });
+          const data = await res.json();
+          if (data.error) {
+            resultEl.textContent = 'Error: ' + data.error;
+          } else {
+            refinedEl.textContent = data.refined_prompt || '(n/a)';
+            resultEl.textContent = data.response || '';
+          }
+        } catch (err) {
+          resultEl.textContent = 'Network error: ' + err.message;
+        } finally {
+          statusEl.textContent = '';
+          recordBtn.disabled = false;
+          recordBtn.textContent = 'Start Recording';
+          stream.getTracks().forEach(t => t.stop());
+        }
+      };
+
+      mediaRecorder.start();
+      recordBtn.textContent = 'Recording...';
+      recordBtn.disabled = true;
+      statusEl.textContent = 'Recording 5 seconds...';
+
+      setTimeout(() => mediaRecorder.stop(), 5000);
+    }
+
+    recordBtn.addEventListener('click', record);
+  </script>
+</body>
+</html>

@@ -1,0 +1,1 @@
+json<br>{<br> "build": { "builder": "NIXPACKS" },<br> "variables": { "PYTHONUNBUFFERED": "1" }<br>}

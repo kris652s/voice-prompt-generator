@@ -1,323 +1,204 @@
-from flask import Response, stream_with_context
+ import os
+import time
+import logging
+from collections import defaultdict, deque
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    send_from_directory,
+    Response,
+    stream_with_context,
+)
 from flask_cors import CORS
-import os, tempfile, time, logging
-from collections import deque
 from openai import OpenAI
 
+# ----------------------------
+# App / Config
+# ----------------------------
 app = Flask(__name__, static_folder="static")
-
-# -------- CORS + upload limits --------
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
 CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGIN}})
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25 MB
 
-# -------- Logging --------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("voice-prompt")
 
-# -------- Simple per-IP rate limiter --------
-RATE_WINDOW_SEC = 60         # 1 minute window
-RATE_MAX_REQUESTS = 6        # 6 requests / minute / IP
-_ip_hits: dict[str, deque] = {}
+client = OpenAI()  # uses OPENAI_API_KEY from env
+REFINER_MODEL = os.getenv("REFINER_MODEL", "gpt-4o-mini")
+
+# Light per-IP rate limit
+RATE_WINDOW_SEC = 60
+RATE_MAX_REQUESTS = 6
+_ip_hits: dict[str, deque[float]] = defaultdict(deque)
+
 
 def _too_many(ip: str) -> bool:
     now = time.time()
-    q = _ip_hits.setdefault(ip, deque())
-    # drop old
-    while q and q[0] < now - RATE_WINDOW_SEC:
-        q.popleft()
-    if len(q) >= RATE_MAX_REQUESTS:
-        return True
-    q.append(now)
-    return False
+    dq = _ip_hits[ip]
+    dq.append(now)
+    while dq and now - dq[0] > RATE_WINDOW_SEC:
+        dq.popleft()
+    return len(dq) > RATE_MAX_REQUESTS
 
-# -------- Lazy OpenAI client --------
-_client = None
-def get_client():
-    global _client
-    if _client is None:
-        key = os.getenv("OPENAI_API_KEY")
-        if not key:
-            raise RuntimeError("OPENAI_API_KEY is not set")
-        _client = OpenAI(api_key=key)
-    return _client
 
-# -------- Health & static --------
+# ----------------------------
+# Utilities
+# ----------------------------
+def _require_audio():
+    audio_file = request.files.get("audio")
+    if not audio_file:
+        return None, (jsonify({"error": "No 'audio' file in form-data"}), 400)
+    return audio_file, None
+
+
+def _transcribe(audio_file) -> str:
+    """
+    Whisper (server-side). Returns the transcribed text.
+    """
+    tr = client.audio.transcriptions.create(model="whisper-1", file=audio_file)
+    text = (tr.text or "").strip()
+    return text
+
+
+def _refine(raw_text: str) -> str:
+    """
+    Safe prompt refiner:
+    - Keep user's original meaning exactly.
+    - If not English, translate to clear natural English.
+    - Remove filler words, keep key details.
+    - Output ONLY the refined prompt (no preamble, no quotes).
+    """
+    raw = (raw_text or "").strip()
+    if not raw:
+        return raw
+
+    instruction = (
+        "Rewrite the user's utterance into a clear, concise prompt for an LLM.\n"
+        "Requirements:\n"
+        "- Preserve the user's original meaning exactly.\n"
+        "- If the text is not in English, translate it to natural English.\n"
+        "- Remove filler words and hesitations, keep essential details.\n"
+        "- Do NOT invent details or add assumptions.\n"
+        "- Output ONLY the refined prompt, no extra commentary."
+    )
+
+    try:
+        resp = client.responses.create(
+            model=REFINER_MODEL,
+            input=f"{instruction}\n\nUser utterance:\n{raw}",
+        )
+        refined = (resp.output_text or "").strip()
+        # Fallback if the model returned nothing
+        return refined if refined else raw
+    except Exception as e:
+        log.exception("Refiner failed")
+        return raw
+
+
+def _chat_once(model: str, prompt: str) -> str:
+    """
+    Single Responses API call; returns plain text.
+    """
+    try:
+        resp = client.responses.create(model=model, input=prompt)
+        return (resp.output_text or "").strip()
+    except Exception as e:
+        log.exception("LLM call failed")
+        return f"[LLM error] {e}"
+
+
+# ----------------------------
+# Health & Static
+# ----------------------------
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return jsonify({"ok": True})
+
 
 @app.get("/")
-def root():
+def index():
     return send_from_directory(app.static_folder, "index.html")
 
-# -------- Main endpoint --------
+
+# ----------------------------
+# Non-streaming endpoint
+# ----------------------------
 @app.post("/process-voice")
 def process_voice():
-    # (rate limit – keep if your file already has _too_many)
-    ip = (request.headers.get("x-forwarded-for") or request.remote_addr or "").split(",")[0].strip()
-    try:
-        if _too_many(ip):
-            return jsonify({"error": "Too many requests. Try again in a minute."}), 429
-    except NameError:
-        # if you don't have _too_many in your file, ignore rate limiting
-        pass
-
-    if "audio" not in request.files:
-        return jsonify({"error": "No 'audio' file in form-data"}), 400
-
-    up = request.files["audio"]
-    model = (request.form.get("model") or "gpt-4o-mini").strip()
-
-    # NEW: respect the mime from the browser (Safari uses audio/mp4)
-    mime = (request.form.get("mime") or up.mimetype or "").lower()
-    ext = ".mp4" if mime.startswith("audio/mp4") else ".webm"
-
-    # Save upload to a temp file with the right extension
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        up.save(tmp.name)
-        path = tmp.name
-
-    try:
-        client = get_client()
-
-        # 1) Speech → English (prefer translations; fallback to transcription + translate)
-        try:
-            transcript_text = client.audio.translations.create(
-                model="whisper-1",
-                file=open(path, "rb"),
-                response_format="text",
-                temperature=0
-            ).strip()
-        except Exception:
-            raw_text = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=open(path, "rb"),
-                response_format="text",
-                temperature=0
-            ).strip()
-            tr = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Translate to natural English while preserving meaning."},
-                    {"role": "user", "content": raw_text}
-                ],
-                temperature=0
-            )
-            transcript_text = tr.choices[0].message.content.strip()
-
-        # 2) Refine into a clean, actionable prompt
-        refine = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content":
-                 "You are a prompt engineer. Given the user's raw intent, output a single, clear, action-oriented prompt an LLM can execute directly. Fix grammar, add obvious specifics, and keep it concise. Output ONLY the final prompt."},
-                {"role": "user", "content": transcript_text}
-            ],
-            temperature=0
-        )
-        refined_prompt = refine.choices[0].message.content.strip()
-
-        # 3) Execute the refined prompt
-        final = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": refined_prompt}],
-            temperature=0.2
-        )
-        final_text = final.choices[0].message.content.strip()
-
-        return jsonify({"refined_prompt": refined_prompt, "response": final_text})
-
-    except Exception as e:
-        try:
-            log.exception("process_voice failed")  # ok if you have 'log' set up
-        except Exception:
-            pass
-        return jsonify({"error": str(e)}), 500
-    finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-def process_voice():
-    ip = (request.headers.get("x-forwarded-for") or request.remote_addr or "").split(",")[0].strip()
+    ip = request.headers.get("x-forwarded-for", request.remote_addr or "ip")
     if _too_many(ip):
-        return jsonify({"error": "Too many requests. Try again in a minute."}), 429
+        return jsonify({"error": "Too many requests"}), 429
 
-    if "audio" not in request.files:
-        return jsonify({"error": "No 'audio' file in form-data"}), 400
+    audio_file, err = _require_audio()
+    if err:
+        return err
 
-    model = (request.form.get("model") or "gpt-4o-mini").strip()
-    up = request.files["audio"]
+    model = request.form.get("model", "gpt-4o-mini")
 
-    # Save upload to temp file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
-        up.save(tmp.name)
-        path = tmp.name
+    # 1) STT
+    raw_text = _transcribe(audio_file)
 
-    try:
-        client = get_client()
-        log.info("IP %s - processing audio (%s bytes) model=%s", ip, up.content_length, model)
+    # 2) Refine (safe)
+    refined_prompt = _refine(raw_text)
 
-        # 1) Speech → English: try translations first
-        try:
-            transcript_text = client.audio.translations.create(
-                model="whisper-1",
-                file=open(path, "rb"),
-                response_format="text",
-                temperature=0
-            ).strip()
-        except Exception as e1:
-            log.warning("translations failed (%s), falling back to transcription", e1)
-            raw_text = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=open(path, "rb"),
-                response_format="text",
-                temperature=0
-            ).strip()
-            tr = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "Translate to natural English while preserving meaning."},
-                    {"role": "user", "content": raw_text}
-                ],
-                temperature=0
-            )
-            transcript_text = tr.choices[0].message.content.strip()
+    # 3) LLM
+    final = _chat_once(model, refined_prompt)
 
-        # 2) Refine into a clean, actionable prompt (use a cheap fast model)
-        refine = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content":
-                 "You are a prompt engineer. Given the user's raw intent, output a single, clear, action-oriented prompt an LLM can execute directly. Fix grammar, add obvious specifics, keep it concise. Output ONLY the final prompt."},
-                {"role": "user", "content": transcript_text}
-            ],
-            temperature=0
-        )
-        refined_prompt = refine.choices[0].message.content.strip()
+    return jsonify(
+        {
+            "raw": raw_text,
+            "refined": refined_prompt,
+            "response": final,
+        }
+    )
 
-        # 3) Execute the refined prompt (use selected model)
-        final = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": refined_prompt}],
-            temperature=0.2
-        )
-        final_text = final.choices[0].message.content.strip()
 
-        return jsonify({"refined_prompt": refined_prompt, "response": final_text})
-
-    except Exception as e:
-        log.exception("process_voice failed")
-        return jsonify({"error": str(e)}), 500
-    finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
+# ----------------------------
+# Streaming endpoint (text/plain stream)
+# ----------------------------
 @app.post("/process-voice-stream")
 def process_voice_stream():
-    # optional rate limit (works if _too_many is defined in your file)
-    ip = (request.headers.get("x-forwarded-for") or request.remote_addr or "").split(",")[0].strip()
-    try:
-        if _too_many(ip):
-            return jsonify({"error": "Too many requests. Try again in a minute."}), 429
-    except Exception:
-        pass
+    ip = request.headers.get("x-forwarded-for", request.remote_addr or "ip")
+    if _too_many(ip):
+        return jsonify({"error": "Too many requests"}), 429
 
-    if "audio" not in request.files:
-        return jsonify({"error": "No 'audio' file in form-data"}), 400
+    audio_file, err = _require_audio()
+    if err:
+        return err
 
-    up = request.files["audio"]
-    model = (request.form.get("model") or "gpt-4o-mini").strip()
+    model = request.form.get("model", "gpt-4o-mini")
 
-    # pick extension by mime (Safari sends audio/mp4)
-    mime = (request.form.get("mime") or up.mimetype or "").lower()
-    ext = ".mp4" if mime.startswith("audio/mp4") else ".webm"
+    # 1) STT
+    raw_text = _transcribe(audio_file)
 
-    import tempfile, os
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        up.save(tmp.name)
-        path = tmp.name
+    # 2) Refine (safe)
+    refined_prompt = _refine(raw_text)
 
+    # 3) Stream LLM output
     def generate():
         try:
-            client = get_client()
-
-            # 1) Speech → English (prefer translations)
-            try:
-                transcript_text = client.audio.translations.create(
-                    model="whisper-1",
-                    file=open(path, "rb"),
-                    response_format="text",
-                    temperature=0
-                ).strip()
-            except Exception:
-                raw_text = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=open(path, "rb"),
-                    response_format="text",
-                    temperature=0
-                ).strip()
-                tr = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "Translate to natural English while preserving meaning."},
-                        {"role": "user", "content": raw_text}
-                    ],
-                    temperature=0
-                )
-                transcript_text = tr.choices[0].message.content.strip()
-
-            # 2) Refine prompt (non-streaming, quick)
-            refine = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content":
-                     "You are a prompt engineer. Given the user's raw intent, output a single, clear, action-oriented prompt an LLM can execute directly. Fix grammar, add obvious specifics, keep it concise. Output ONLY the final prompt."},
-                    {"role": "user", "content": transcript_text}
-                ],
-                temperature=0
-            )
-            refined_prompt = refine.choices[0].message.content.strip()
-
-            # send a header line the client can parse
-            yield f"__REFINED_PROMPT__:{refined_prompt}\n"
-
-            # 3) Stream final answer tokens
-            stream = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": refined_prompt}],
-                temperature=0.2,
-                stream=True,
-            )
-            for chunk in stream:
-                delta = ""
-                try:
-                    delta = chunk.choices[0].delta.content or ""
-                except Exception:
-                    delta = ""
-                if delta:
-                    yield delta
-
+            with client.responses.stream(model=model, input=refined_prompt) as stream:
+                for event in stream:
+                    if getattr(event, "type", "") == "response.output_text.delta":
+                        chunk = getattr(event, "delta", "")
+                        if chunk:
+                            yield chunk
+                stream.close()
         except Exception as e:
-            try:
-                log.exception("process_voice_stream failed")
-            except Exception:
-                pass
-            yield f"\n[ERROR] {str(e)}\n"
-        finally:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+            log.exception("Streaming LLM failed")
+            yield f"\n[stream error] {e}"
 
-    return Response(stream_with_context(generate()), mimetype="text/plain")
+    resp = Response(stream_with_context(generate()), mimetype="text/plain")
+    # Let the frontend read the refined text while streaming
+    resp.headers["X-Refined-Prompt"] = refined_prompt
+    resp.headers["X-Transcript"] = raw_text
+    return resp
 
 
+# ----------------------------
+# Local run (Railway uses gunicorn)
+# ----------------------------
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)

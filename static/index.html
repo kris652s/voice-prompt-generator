@@ -226,7 +226,29 @@
       stopRecording();
       setStatus('Stopping…');
     });
-   
+   // ---- copy / download helpers ----
+async function copyBox(id) {
+  try {
+    const el = document.getElementById(id);
+    await navigator.clipboard.writeText(el.textContent || '');
+    setStatus('Copied to clipboard', true, false);
+  } catch (e) {
+    setStatus('Copy failed: ' + e.message, false, true);
+  }
+}
+
+function downloadBox(id, filename) {
+  const el = document.getElementById(id);
+  const text = el.textContent || '';
+  const blob = new Blob([text], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
   </script>
 </body>
 </html>

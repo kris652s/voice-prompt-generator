@@ -11,7 +11,8 @@
     p,h3   { margin: 10px 0; }
     button { padding: 10px 16px; font-size: 16px; cursor: pointer; }
     input[type="range"] { vertical-align: middle; width: 220px; }
-    #status { margin: 8px 0; opacity: .8; min-height: 22px; }
+    select { padding: 6px 10px; font-size: 14px; }
+    #status { margin: 8px 0; opacity: .85; min-height: 22px; }
     .box { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; border-radius: 10px; margin-top: 10px; background: #fafafa; }
     .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     .muted { opacity: .8; font-size: 14px; }
@@ -26,12 +27,16 @@
   <div class="row" style="margin-bottom:8px">
     <button id="recordBtn">Start Recording</button>
     <button id="stopBtn" disabled>Stop</button>
-    <label>
-      Duration:
-      <strong><span id="secs">5</span>s</strong>
-    </label>
+
+    <label>Duration: <strong><span id="secs">5</span>s</strong></label>
     <input id="dur" type="range" min="3" max="20" value="5">
     <span id="countdown" class="muted"></span>
+
+    <label>Model:</label>
+    <select id="model">
+      <option value="gpt-4o-mini" selected>gpt-4o-mini (fast/cheap)</option>
+      <option value="gpt-4o">gpt-4o (smarter)</option>
+    </select>
   </div>
 
   <div id="status"></div>
@@ -51,10 +56,10 @@
     const refinedEl  = document.getElementById('refined');
     const resultEl   = document.getElementById('result');
     const countdown  = document.getElementById('countdown');
+    const modelSel   = document.getElementById('model');
 
     let mediaRecorder, chunks = [], stream, timer, countdownTick;
 
-    // show current slider value
     dur.addEventListener('input', () => secs.textContent = dur.value);
     secs.textContent = dur.value;
 
@@ -67,7 +72,7 @@
       if (!window.MediaRecorder) return '';
       if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
       if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
-      return ''; // fallback not implemented; most Chromium/Firefox support webm.
+      return '';
     }
 
     async function startRecording() {
@@ -85,15 +90,14 @@
         mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
 
         mediaRecorder.onstop = async () => {
-          // stop countdown & mic
           if (countdownTick) clearInterval(countdownTick);
           countdown.textContent = '';
           if (stream) stream.getTracks().forEach(t => t.stop());
 
-          // send to backend
           const blob = new Blob(chunks, { type: 'audio/webm' });
           const form = new FormData();
           form.append('audio', blob, 'audio.webm');
+          form.append('model', modelSel.value);
 
           setStatus('Processing…');
           refinedEl.textContent = '';
@@ -102,7 +106,6 @@
           try {
             const res = await fetch('/process-voice', { method: 'POST', body: form });
             const data = await res.json();
-
             if (data.error) {
               resultEl.textContent = 'Error: ' + data.error;
               setStatus('Finished with error', false, true);
@@ -120,7 +123,6 @@
           }
         };
 
-        // start recording
         mediaRecorder.start();
         recordBtn.disabled = true;
         stopBtn.disabled = false;

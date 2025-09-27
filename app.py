@@ -1,4 +1,4 @@
-import os
+ import os
 import time
 import logging
 from collections import defaultdict, deque
@@ -88,8 +88,8 @@ def _transcribe_from_path(path: str) -> str:
 
 def _refine(raw_text: str) -> str:
     """
-    Safe prompt refiner:
-    - Preserve user's meaning exactly.
+    Safe prompt refiner via Chat Completions:
+    - Preserve user's meaning.
     - If not English, translate to natural English.
     - Remove filler words; keep essential details.
     - Output ONLY the refined prompt (no preamble).
@@ -98,22 +98,27 @@ def _refine(raw_text: str) -> str:
     if not raw:
         return raw
 
-    instruction = (
-        "Rewrite the user's utterance into a clear, concise prompt for an LLM.\n"
-        "Requirements:\n"
+    system_msg = (
+        "You are a prompt refiner. Rewrite the user's utterance into a clear, concise prompt "
+        "for an LLM. Requirements:\n"
         "- Preserve the user's original meaning exactly.\n"
         "- If the text is not in English, translate it to natural English.\n"
         "- Remove filler words and hesitations; keep essential details.\n"
         "- Do NOT invent details or add assumptions.\n"
         "- Output ONLY the refined prompt, no extra commentary."
     )
+
     client = get_client()
     try:
-        resp = client.responses.create(
+        chat = client.chat.completions.create(
             model=REFINER_MODEL,
-            input=f"{instruction}\n\nUser utterance:\n{raw}",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": raw},
+            ],
+            temperature=0.2,
         )
-        refined = (resp.output_text or "").strip()
+        refined = (chat.choices[0].message.content or "").strip()
         return refined if refined else raw
     except Exception:
         log.exception("Refiner failed; falling back to raw.")
@@ -122,12 +127,16 @@ def _refine(raw_text: str) -> str:
 
 def _chat_once(model: str, prompt: str) -> str:
     """
-    Single Responses API call; returns plain text.
+    Single Chat Completions call; returns plain text.
     """
     client = get_client()
     try:
-        resp = client.responses.create(model=model, input=prompt)
-        return (resp.output_text or "").strip()
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+        return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         log.exception("LLM call failed")
         return f"[LLM error] {e}"
@@ -211,14 +220,21 @@ def process_voice_stream():
     def generate(refined_prompt: str):
         client = get_client()
         try:
-            # Stream final LLM answer
-            with client.responses.stream(model=model, input=refined_prompt) as stream:
-                for event in stream:
-                    if getattr(event, "type", "") == "response.output_text.delta":
-                        chunk = getattr(event, "delta", "")
-                        if chunk:
-                            yield chunk
-                stream.close()
+            # Stream via Chat Completions
+            stream = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": refined_prompt}],
+                stream=True,
+                temperature=0.7,
+            )
+            for chunk in stream:
+                try:
+                    delta = chunk.choices[0].delta
+                    if delta and getattr(delta, "content", None):
+                        yield delta.content
+                except Exception:
+                    # tolerate any partial chunks
+                    continue
         except Exception as e:
             log.exception("Streaming LLM failed")
             yield f"\n[stream error] {e}"

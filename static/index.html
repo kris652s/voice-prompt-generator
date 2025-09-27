@@ -54,6 +54,10 @@
 
   <h3>LLM Response</h3>
   <div id="result" class="box"></div>
+<div class="row">
+  <button onclick="copyBox('result')">Copy response</button>
+  <button onclick="downloadBox('result','llm-response.txt')">Download</button>
+</div>
 
   <script>
     const recordBtn  = document.getElementById('recordBtn');
@@ -222,6 +226,7 @@
       stopRecording();
       setStatus('Stopping…');
     });
+   
   </script>
 </body>
 </html>

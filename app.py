@@ -7,7 +7,6 @@ app = Flask(__name__, static_folder="static")
 CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB
 
-# Lazy OpenAI client
 _client = None
 def get_client():
     global _client
@@ -32,7 +31,6 @@ def process_voice():
         return jsonify({"error": "No 'audio' file in form-data"}), 400
     up = request.files["audio"]
 
-    # Save upload to temp file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
         up.save(tmp.name)
         path = tmp.name
@@ -40,22 +38,22 @@ def process_voice():
     try:
         client = get_client()
 
-        # 1) Speech → English (prefer translations; fallback to transcription + LLM translate)
+        # 1) Try direct English via translations
         try:
             transcript_text = client.audio.translations.create(
-                model="whisper-1",           # English output
+                model="whisper-1",
                 file=open(path, "rb"),
                 response_format="text",
                 temperature=0
             ).strip()
         except Exception:
+            # Fallback: STT then translate via Chat Completions
             raw_text = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=open(path, "rb"),
                 response_format="text",
                 temperature=0
             ).strip()
-            # Translate to English via Chat Completions
             tr = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -66,19 +64,19 @@ def process_voice():
             )
             transcript_text = tr.choices[0].message.content.strip()
 
-        # 2) Refine into a clean, actionable prompt (Chat Completions)
+        # 2) Refine into a clean, actionable prompt
         refine = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content":
-                    "You are a prompt engineer. Given the user's raw intent, output a single, clear, action-oriented prompt that an LLM can execute directly. Fix grammar, add obvious specifics, and keep it concise. Output ONLY the final prompt."},
+                 "You are a prompt engineer. Given the user's raw intent, output a single, clear, action-oriented prompt that an LLM can execute directly. Fix grammar, add obvious specifics, and keep it concise. Output ONLY the final prompt."},
                 {"role": "user", "content": transcript_text}
             ],
             temperature=0
         )
         refined_prompt = refine.choices[0].message.content.strip()
 
-        # 3) Execute the refined prompt (Chat Completions)
+        # 3) Execute the refined prompt
         final = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": refined_prompt}],
@@ -91,12 +89,9 @@ def process_voice():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
+        try: os.remove(path)
+        except Exception: pass
 
 if __name__ == "__main__":
-    import os as _os
-    port = int(_os.getenv("PORT", 5000))
+    port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

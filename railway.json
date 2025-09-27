@@ -1,6 +1,7 @@
-{
+ {
   "build": { "builder": "NIXPACKS" },
   "variables": {
-    "PYTHONUNBUFFERED": "1"
+    "PYTHONUNBUFFERED": "1",
+    "PYTHON_VERSION": "3.11"
   }
 }

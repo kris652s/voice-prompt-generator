@@ -4,7 +4,11 @@ import os, tempfile
 from openai import OpenAI
 
 app = Flask(__name__, static_folder="static")
-CORS(app)
+# lock CORS to one origin (set ALLOWED_ORIGIN in Railway Variables)
+ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
+CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGIN}})
+
+app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB
 app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB
 
 _client = None

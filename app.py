@@ -54,6 +54,93 @@ def root():
 # -------- Main endpoint --------
 @app.post("/process-voice")
 def process_voice():
+    # (rate limit – keep if your file already has _too_many)
+    ip = (request.headers.get("x-forwarded-for") or request.remote_addr or "").split(",")[0].strip()
+    try:
+        if _too_many(ip):
+            return jsonify({"error": "Too many requests. Try again in a minute."}), 429
+    except NameError:
+        # if you don't have _too_many in your file, ignore rate limiting
+        pass
+
+    if "audio" not in request.files:
+        return jsonify({"error": "No 'audio' file in form-data"}), 400
+
+    up = request.files["audio"]
+    model = (request.form.get("model") or "gpt-4o-mini").strip()
+
+    # NEW: respect the mime from the browser (Safari uses audio/mp4)
+    mime = (request.form.get("mime") or up.mimetype or "").lower()
+    ext = ".mp4" if mime.startswith("audio/mp4") else ".webm"
+
+    # Save upload to a temp file with the right extension
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        up.save(tmp.name)
+        path = tmp.name
+
+    try:
+        client = get_client()
+
+        # 1) Speech → English (prefer translations; fallback to transcription + translate)
+        try:
+            transcript_text = client.audio.translations.create(
+                model="whisper-1",
+                file=open(path, "rb"),
+                response_format="text",
+                temperature=0
+            ).strip()
+        except Exception:
+            raw_text = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=open(path, "rb"),
+                response_format="text",
+                temperature=0
+            ).strip()
+            tr = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Translate to natural English while preserving meaning."},
+                    {"role": "user", "content": raw_text}
+                ],
+                temperature=0
+            )
+            transcript_text = tr.choices[0].message.content.strip()
+
+        # 2) Refine into a clean, actionable prompt
+        refine = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content":
+                 "You are a prompt engineer. Given the user's raw intent, output a single, clear, action-oriented prompt an LLM can execute directly. Fix grammar, add obvious specifics, and keep it concise. Output ONLY the final prompt."},
+                {"role": "user", "content": transcript_text}
+            ],
+            temperature=0
+        )
+        refined_prompt = refine.choices[0].message.content.strip()
+
+        # 3) Execute the refined prompt
+        final = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": refined_prompt}],
+            temperature=0.2
+        )
+        final_text = final.choices[0].message.content.strip()
+
+        return jsonify({"refined_prompt": refined_prompt, "response": final_text})
+
+    except Exception as e:
+        try:
+            log.exception("process_voice failed")  # ok if you have 'log' set up
+        except Exception:
+            pass
+        return jsonify({"error": str(e)}), 500
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+def process_voice():
     ip = (request.headers.get("x-forwarded-for") or request.remote_addr or "").split(",")[0].strip()
     if _too_many(ip):
         return jsonify({"error": "Too many requests. Try again in a minute."}), 429

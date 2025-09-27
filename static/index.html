@@ -58,7 +58,7 @@
     const countdown  = document.getElementById('countdown');
     const modelSel   = document.getElementById('model');
 
-    let mediaRecorder, chunks = [], stream, timer, countdownTick;
+    let mediaRecorder, chunks = [], stream, timer, countdownTick, chosenMime = '';
 
     dur.addEventListener('input', () => secs.textContent = dur.value);
     secs.textContent = dur.value;
@@ -68,24 +68,27 @@
       statusEl.className = ok ? 'ok' : (error ? 'err' : '');
     }
 
-    function supportsMime() {
+    function pickMimeType() {
+      // Prefer WebM/Opus, then WebM generic, then MP4/AAC (Safari)
       if (!window.MediaRecorder) return '';
       if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
       if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
+      if (MediaRecorder.isTypeSupported('audio/mp4;codecs=mp4a.40.2')) return 'audio/mp4;codecs=mp4a.40.2';
+      if (MediaRecorder.isTypeSupported('audio/mp4')) return 'audio/mp4';
       return '';
     }
 
     async function startRecording() {
       try {
-        const mimeType = supportsMime();
-        if (!mimeType) {
-          setStatus('Your browser does not support audio/webm recording. Try Chrome or Edge.', false, true);
+        chosenMime = pickMimeType();
+        if (!chosenMime) {
+          setStatus('Your browser does not support in-browser audio recording. Try Chrome, Edge, or Safari 14+.', false, true);
           return;
         }
 
         chunks = [];
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder = new MediaRecorder(stream, { mimeType });
+        mediaRecorder = new MediaRecorder(stream, { mimeType: chosenMime });
 
         mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
 
@@ -94,9 +97,11 @@
           countdown.textContent = '';
           if (stream) stream.getTracks().forEach(t => t.stop());
 
-          const blob = new Blob(chunks, { type: 'audio/webm' });
+          const ext = chosenMime.startsWith('audio/mp4') ? 'mp4' : 'webm';
+          const blob = new Blob(chunks, { type: chosenMime });
           const form = new FormData();
-          form.append('audio', blob, 'audio.webm');
+          form.append('audio', blob, `audio.${ext}`);
+          form.append('mime', chosenMime);
           form.append('model', modelSel.value);
 
           setStatus('Processing…');

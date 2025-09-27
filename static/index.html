@@ -12,6 +12,7 @@
     button { padding: 10px 16px; font-size: 16px; cursor: pointer; }
     input[type="range"] { vertical-align: middle; width: 220px; }
     select { padding: 6px 10px; font-size: 14px; }
+    label  { margin-right: 6px; }
     #status { margin: 8px 0; opacity: .85; min-height: 22px; }
     .box { white-space: pre-wrap; border: 1px solid #ddd; padding: 12px; border-radius: 10px; margin-top: 10px; background: #fafafa; }
     .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -37,6 +38,8 @@
       <option value="gpt-4o-mini" selected>gpt-4o-mini (fast/cheap)</option>
       <option value="gpt-4o">gpt-4o (smarter)</option>
     </select>
+
+    <label><input type="checkbox" id="streamToggle" checked> Stream response</label>
   </div>
 
   <div id="status"></div>
@@ -57,6 +60,7 @@
     const resultEl   = document.getElementById('result');
     const countdown  = document.getElementById('countdown');
     const modelSel   = document.getElementById('model');
+    const streamToggle = document.getElementById('streamToggle');
 
     let mediaRecorder, chunks = [], stream, timer, countdownTick, chosenMime = '';
 
@@ -69,7 +73,6 @@
     }
 
     function pickMimeType() {
-      // Prefer WebM/Opus, then WebM generic, then MP4/AAC (Safari)
       if (!window.MediaRecorder) return '';
       if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) return 'audio/webm;codecs=opus';
       if (MediaRecorder.isTypeSupported('audio/webm')) return 'audio/webm';
@@ -104,27 +107,75 @@
           form.append('mime', chosenMime);
           form.append('model', modelSel.value);
 
-          setStatus('Processing…');
           refinedEl.textContent = '';
-          resultEl.textContent = '';
+          resultEl.textContent  = '';
+          setStatus('Processing…');
 
           try {
-            const res = await fetch('/process-voice', { method: 'POST', body: form });
-            const data = await res.json();
-            if (data.error) {
-              resultEl.textContent = 'Error: ' + data.error;
-              setStatus('Finished with error', false, true);
-            } else {
-              refinedEl.textContent = data.refined_prompt || '(n/a)';
-              resultEl.textContent = data.response || '';
+            if (streamToggle.checked) {
+              // STREAMING: read the response body in chunks
+              const res = await fetch('/process-voice-stream', { method: 'POST', body: form });
+              if (!res.ok) {
+                const txt = await res.text();
+                resultEl.textContent = 'Error: ' + txt;
+                setStatus('Finished with error', false, true);
+                resetButtons();
+                return;
+              }
+              // first line contains the refined prompt marker
+              const reader = res.body.getReader();
+              const dec = new TextDecoder();
+              let buf = '';
+              let first = true;
+
+              while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                buf += dec.decode(value, { stream: true });
+
+                // Process lines
+                let idx;
+                while ((idx = buf.indexOf('\n')) >= 0) {
+                  const line = buf.slice(0, idx);
+                  buf = buf.slice(idx + 1);
+
+                  if (first && line.startsWith('__REFINED_PROMPT__:')) {
+                    refinedEl.textContent = line.replace('__REFINED_PROMPT__:', '');
+                    first = false;
+                  } else {
+                    resultEl.textContent += line;
+                  }
+                }
+              }
+
+              // flush any remaining text
+              if (buf) {
+                if (first && buf.startsWith('__REFINED_PROMPT__:')) {
+                  refinedEl.textContent = buf.replace('__REFINED_PROMPT__:', '');
+                } else {
+                  resultEl.textContent += buf;
+                }
+              }
+
               setStatus('Done', true, false);
+            } else {
+              // NON-STREAM fallback
+              const res = await fetch('/process-voice', { method: 'POST', body: form });
+              const data = await res.json();
+              if (data.error) {
+                resultEl.textContent = 'Error: ' + data.error;
+                setStatus('Finished with error', false, true);
+              } else {
+                refinedEl.textContent = data.refined_prompt || '(n/a)';
+                resultEl.textContent  = data.response || '';
+                setStatus('Done', true, false);
+              }
             }
           } catch (err) {
             resultEl.textContent = 'Network error: ' + err.message;
             setStatus('Network error', false, true);
           } finally {
-            recordBtn.disabled = false;
-            stopBtn.disabled = true;
+            resetButtons();
           }
         };
 
@@ -134,11 +185,12 @@
         const seconds = parseInt(dur.value, 10);
         let remain = seconds;
         countdown.textContent = `(${remain}s)`;
-        countdownTick = setInterval(() => {
+        const tick = () => {
           remain -= 1;
           countdown.textContent = remain > 0 ? `(${remain}s)` : '';
-          if (remain <= 0) { clearInterval(countdownTick); }
-        }, 1000);
+          if (remain <= 0) clearInterval(countdownTick);
+        };
+        countdownTick = setInterval(tick, 1000);
 
         setStatus(`Recording ${seconds}s…`);
         timer = setTimeout(stopRecording, seconds * 1000);
@@ -152,6 +204,11 @@
       if (mediaRecorder && mediaRecorder.state === 'recording') {
         mediaRecorder.stop();
       }
+    }
+
+    function resetButtons() {
+      recordBtn.disabled = false;
+      stopBtn.disabled = true;
     }
 
     recordBtn.addEventListener('click', startRecording);
